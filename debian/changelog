@@ -1,0 +1,5 @@
+mlbstreamer (0.0.2-1) unstable; urgency=medium
+
+  * First release (Closes: #894426)
+
+ -- Sebastien Delafond <seb@debian.org>  Fri, 30 Mar 2018 09:10:07 +0200
