@@ -1,0 +1,4 @@
+build
+dist
+mlbstreamer.egg-info
+*.pyc

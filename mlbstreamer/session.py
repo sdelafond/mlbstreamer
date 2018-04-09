@@ -135,7 +135,7 @@ class MLBSession(object):
 
     def login(self):
 
-        logger.debug("logging in")
+        logger.debug("checking for existing log in")
 
         initial_url = ("https://secure.mlb.com/enterworkflow.do"
                        "?flowId=registration.wizard&c_id=mlb")
@@ -154,7 +154,8 @@ class MLBSession(object):
         if self.logged_in:
             logger.debug("already logged in")
             return
-        logger.debug("logging in")
+
+        logger.debug("attempting new log in")
 
         login_url = "https://securea.mlb.com/authenticate.do"
 
@@ -346,7 +347,8 @@ class MLBSession(object):
         schedule = self.schedule(game_id=game_id)
         # raise Exception(schedule)
         try:
-            game = schedule["dates"][0]["games"][0]
+            # Get last date for games that have been rescheduled to a later date
+            game = schedule["dates"][-1]["games"][0]
         except KeyError:
             logger.debug("no game data")
             return
