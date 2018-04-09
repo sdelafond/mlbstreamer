@@ -1,3 +1,9 @@
+mlbstreamer (0.0.8-1) unstable; urgency=medium
+
+  * New upstream version
+
+ -- Sebastien Delafond <seb@debian.org>  Mon, 09 Apr 2018 08:27:43 +0200
+
 mlbstreamer (0.0.2-2) unstable; urgency=medium
 
   * Add dependency on streamlink
