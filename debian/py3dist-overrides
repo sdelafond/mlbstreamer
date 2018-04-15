@@ -1,3 +1,5 @@
 py_dateutil python3-dateutil
 orderedattrdict python3-orderedattrdict
 pymemoize python3-memoize
+panwid python3-panwid
+urwid_utils python3-urwid-utils
