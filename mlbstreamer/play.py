@@ -15,6 +15,7 @@ from orderedattrdict import AttrDict
 
 from . import config
 from . import state
+from .util import *
 from .session import *
 
 class MLBPlayException(Exception):
@@ -23,17 +24,23 @@ class MLBPlayException(Exception):
 class MLBPlayInvalidArgumentError(MLBPlayException):
     pass
 
-
-def play_stream(game_specifier, resolution,
-                offset_from_beginning=None,
+def play_stream(game_specifier, resolution=None,
+                offset=None,
+                media_id = None,
                 preferred_stream=None,
-                output=None,
-                date_json=None):
+                call_letters=None,
+                output=None):
 
     live = False
-    offset = None
     team = None
     game_number = 1
+    sport_code = "mlb" # default sport is MLB
+
+    media_title = "MLBTV"
+    media_id = None
+
+    if resolution is None:
+        resolution = "best"
 
     if isinstance(game_specifier, int):
         game_id = game_specifier
@@ -47,19 +54,37 @@ def play_stream(game_specifier, resolution,
         except ValueError:
             (game_date, team) = game_specifier
 
+        if "/" in team:
+            (sport_code, team) = team.split("/")
+
+
+        if sport_code != "mlb":
+            media_title = "MiLBTV"
+            raise MLBPlayException("Sorry, MiLB.tv streams are not yet supported")
+
+        sports_url = (
+            "http://statsapi.mlb.com/api/v1/sports"
+        )
+        with state.session.cache_responses_long():
+            sports = state.session.get(sports_url).json()
+
+        sport = next(s for s in sports["sports"] if s["code"] == sport_code)
+
         season = game_date.year
         teams_url = (
             "http://statsapi.mlb.com/api/v1/teams"
             "?sportId={sport}&season={season}".format(
-                sport=1,
+                sport=sport["id"],
                 season=season
             )
         )
-        teams = AttrDict(
-            (team["fileCode"], team["id"])
-            for team in sorted(state.session.get(teams_url).json()["teams"],
-                               key=lambda t: t["fileCode"])
-        )
+
+        with state.session.cache_responses_long():
+            teams = AttrDict(
+                (team["abbreviation"].lower(), team["id"])
+                for team in sorted(state.session.get(teams_url).json()["teams"],
+                                   key=lambda t: t["fileCode"])
+            )
 
         if team not in teams:
             msg = "'%s' not a valid team code, must be one of:\n%s" %(
@@ -70,9 +95,10 @@ def play_stream(game_specifier, resolution,
         schedule = state.session.schedule(
             start = game_date,
             end = game_date,
-            sport_id = 1,
+            sport_id = sport["id"],
             team_id = teams[team]
         )
+
 
     try:
         date = schedule["dates"][-1]
@@ -83,43 +109,73 @@ def play_stream(game_specifier, resolution,
             game_number, team, game_date)
         )
 
-    preferred_stream = (
-        "HOME"
-        if team == game["teams"]["home"]["team"]["fileCode"]
-        else "AWAY"
+    logger.info("playing game %d at %s" %(
+        game_id, resolution)
     )
 
+    if not preferred_stream or call_letters:
+        preferred_stream = (
+            "away"
+            if team == game["teams"]["away"]["team"]["abbreviation"].lower()
+            else "home"
+        )
+
     try:
-        media = next(state.session.get_media(game_id,
-                                             preferred_stream=preferred_stream))
+        media = next(state.session.get_media(
+            game_id,
+            media_id = media_id,
+            title=media_title,
+            preferred_stream=preferred_stream,
+            call_letters = call_letters
+        ))
     except StopIteration:
         raise MLBPlayException("no matching media for game %d" %(game_id))
 
-    media_id = media["mediaId"]
+    media_id = media["mediaId"] if "mediaId" in media else media["guid"]
+
     media_state = media["mediaState"]
 
-    stream = state.session.get_stream(media_id)
+    if "playbacks" in media:
+        playback = media["playbacks"][0]
+        media_url = playback["location"]
+    else:
+        stream = state.session.get_stream(media_id)
 
-    try:
-        media_url = stream["stream"]["complete"]
-    except TypeError:
-        raise MLBPlayException("no stream URL for game %d" %(game_id))
+        try:
+            media_url = stream["stream"]["complete"]
+        except TypeError:
+            raise MLBPlayException("no stream URL for game %d" %(game_id))
 
+    offset_timestamp = None
+    offset_seconds = None
 
-    if (offset_from_beginning is not None):
+    if (offset is not False and offset is not None):
+
+        timestamps = state.session.media_timestamps(game_id, media_id)
+
+        if isinstance(offset, str):
+            if not offset in timestamps:
+                raise MLBPlayException("Couldn't find inning %s" %(offset))
+            offset = timestamps[offset] - timestamps["SO"]
+            logger.debug("inning offset: %s" %(offset))
+
         if (media_state == "MEDIA_ON"): # live stream
+            logger.debug("live stream")
             # calculate HLS offset, which is negative from end of stream
             # for live streams
-            start_time = dateutil.parser.parse(game["gameDate"])
-            offset =  datetime.now(pytz.utc) - (start_time.astimezone(pytz.utc))
-            offset += timedelta(minutes=-(offset_from_beginning))
-            hours, remainder = divmod(offset.seconds, 3600)
-            minutes, seconds = divmod(remainder, 60)
-            offset = "%d:%02d:%02d" %(hours, minutes, seconds)
+            start_time = dateutil.parser.parse(timestamps["S"])
+            offset_delta = (
+                datetime.now(pytz.utc)
+                - start_time.astimezone(pytz.utc)
+                + (timedelta(seconds=-offset))
+            )
         else:
-            td = timedelta(minutes=offset_from_beginning)
-            offset = str(td)
-            logger.info("starting at time offset %s" %(offset))
+            logger.debug("recorded stream")
+            offset_delta = timedelta(seconds=offset)
+
+        offset_seconds = offset_delta.seconds
+        offset_timestamp = str(offset_delta)
+        logger.info("starting at time offset %s" %(offset))
 
     cmd = [
         "streamlink",
@@ -133,15 +189,16 @@ def play_stream(game_specifier, resolution,
     if config.settings.streamlink_args:
         cmd += shlex.split(config.settings.streamlink_args)
 
-    if offset:
-        cmd += ["--hls-start-offset", offset]
+    if offset_timestamp:
+        cmd += ["--hls-start-offset", offset_timestamp]
 
     if output is not None:
         if output == True or os.path.isdir(output):
             outfile = get_output_filename(
                 game,
                 media["callLetters"],
-                resolution
+                resolution,
+                offset=str(offset_seconds)
             )
             if os.path.isdir(output):
                 outfile = os.path.join(output, outfile)
@@ -154,12 +211,8 @@ def play_stream(game_specifier, resolution,
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
     return proc
 
-# def get_date_json(game_id, date_json):
-#     if date_json is not None:
-#         return date_json
-#     return state.session.schedule(game_id=game_id)["dates"][-1]
 
-def get_output_filename(game, station, resolution):
+def get_output_filename(game, station, resolution, offset=None):
     try:
         # if (date is None):
         #     date = state.session.schedule(game_id=game["gamePk"])["dates"][-1]
@@ -172,6 +225,8 @@ def get_output_filename(game, station, resolution):
 
         game_date = start_time.date().strftime("%Y%m%d")
         game_time = start_time.time().strftime("%H%M")
+        if offset:
+            game_time = "%s_%s" %(game_time, offset)
         return "mlb.%s.%s@%s.%s.%s.ts" \
                % (game_date,
                   game["teams"]["away"]["team"]["fileCode"],
@@ -182,12 +237,34 @@ def get_output_filename(game, station, resolution):
     except KeyError:
         return "mlb.%d.%s.ts" % (game["gamePk"], resolution)
 
-def valid_date(s):
-    try:
-        return datetime.strptime(s, "%Y-%m-%d").date()
-    except ValueError:
-        msg = "Not a valid date: '{0}'.".format(s)
-        raise argparse.ArgumentTypeError(msg)
+
+def begin_arg_to_offset(value):
+    if value.isdigit():
+        # Integer number of seconds
+        value = int(value)
+    else:
+        try:
+            value = (
+                datetime.strptime(value, "%H:%M:%S")
+                - datetime.min
+            ).seconds
+        except ValueError:
+            try:
+                value = (
+                    datetime.strptime(value, "%M:%S")
+                    - datetime.min
+                ).seconds
+            except:
+                if not (value == "S"
+                        or (value[0] in "TB" and value[1:].isdigit())
+                ):
+                    raise argparse.ArgumentTypeError(
+                        "Offset must be an integer number of seconds, "
+                        "a time string e.g. 1:23:45, "
+                        "or a string like T1 or B3 to select a half inning"
+                    )
+    return value
+
 
 def main():
 
@@ -201,15 +278,17 @@ def main():
                         help="number of team game on date (for doubleheaders)",
                         default=1,
                         type=int)
-    parser.add_argument("-b", "--beginning",
-                        help="play live streams from beginning",
+    parser.add_argument("-b", "--begin",
+                        help="begin playback at this offset from start",
                         nargs="?", metavar="offset_from_game_start",
-                        type=int,
-                        const=-10)
+                        type=begin_arg_to_offset,
+                        const=0)
     parser.add_argument("-r", "--resolution", help="stream resolution",
                         default="720p")
     parser.add_argument("-s", "--save-stream", help="save stream to file",
                         nargs="?", const=True)
+    parser.add_argument("--no-cache", help="do not use response cache",
+                        action="store_true")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="verbose logging")
     parser.add_argument("--init-config", help="initialize configuration",
@@ -239,7 +318,7 @@ def main():
     if not options.game:
         parser.error("option game")
 
-    state.session = MLBSession.new()
+    state.session = MLBSession.new(no_cache=options.no_cache)
 
     preferred_stream = None
     date = None
@@ -253,7 +332,7 @@ def main():
         proc = play_stream(
             game_specifier,
             options.resolution,
-            offset_from_beginning = options.beginning,
+            offset = options.begin,
             preferred_stream = preferred_stream,
             output = options.save_stream,
         )

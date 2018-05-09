@@ -14,6 +14,7 @@ from urwid_utils.palette import *
 from panwid.datatable import *
 from panwid.listbox import ScrollingListBox
 from panwid.dropdown import *
+from panwid.dialog import *
 
 import pytz
 from orderedattrdict import AttrDict
@@ -28,6 +29,7 @@ from .state import memo
 from . import config
 from . import play
 from . import widgets
+from .util import *
 from .session import *
 
 
@@ -153,13 +155,11 @@ class LineScoreDataTable(DataTable):
 
 class GamesDataTable(DataTable):
 
-    signals = ["watch"]
-
     columns = [
         DataTableColumn("start", width=6, align="right"),
         # DataTableColumn("game_type", label="type", width=5, align="right"),
-        DataTableColumn("away", width=15),
-        DataTableColumn("home", width=15),
+        DataTableColumn("away", width=13),
+        DataTableColumn("home", width=13),
         DataTableColumn("line"),
         # DataTableColumn("game_id", width=6, align="right"),
     ]
@@ -231,6 +231,19 @@ class GamesDataTable(DataTable):
                     line = self.line_score
                 )
 
+class ResolutionDropdown(Dropdown):
+
+    items = [
+        ("720p", "720p_alt"),
+        ("720p@30", "720p"),
+        ("540p", "540p"),
+        ("504p", "504p"),
+        ("360p", "360p"),
+        ("288p", "288p"),
+        ("224p", "224p")
+    ]
+
+    label = "Resolution"
 
 class Toolbar(urwid.WidgetWrap):
 
@@ -239,29 +252,21 @@ class Toolbar(urwid.WidgetWrap):
         self.league_dropdown = Dropdown(AttrDict([
                 ("MLB", 1),
                 ("AAA", 11),
-            ]) , label="League: ")
+            ]) , label="League")
 
         self.live_stream_dropdown = Dropdown([
-            "from beginning",
-            "live"
-        ], label="Live streams: ")
+            "live",
+            "from start"
+        ], label="Live streams")
 
-        self.resolution_dropdown = Dropdown(
-            AttrDict([
-                ("720p (60fps)", "720p_alt"),
-                ("720p", "720p"),
-                ("540p", "540p"),
-                ("504p", "504p"),
-                ("360p", "360p"),
-                ("288p", "288p"),
-                ("224p", "224p")
-            ]), label="resolution")
-
+        self.resolution_dropdown = ResolutionDropdown(
+            default=options.resolution
+        )
         self.columns = urwid.Columns([
-            (20, self.league_dropdown),
-            (36, self.live_stream_dropdown),
-            (30, self.resolution_dropdown),
-            ("weight", 1, urwid.Padding(urwid.Text("")))
+            ('weight', 1, self.league_dropdown),
+            ('weight', 1, self.live_stream_dropdown),
+            ('weight', 1, self.resolution_dropdown),
+            # ("weight", 1, urwid.Padding(urwid.Text("")))
         ])
         self.filler = urwid.Filler(self.columns)
         super(Toolbar, self).__init__(self.filler)
@@ -276,7 +281,8 @@ class Toolbar(urwid.WidgetWrap):
 
     @property
     def start_from_beginning(self):
-        return self.live_stream_dropdown.selected_label == "from beginning"
+        return self.live_stream_dropdown.selected_label == "from start"
+
 
 class DateBar(urwid.WidgetWrap):
 
@@ -288,17 +294,133 @@ class DateBar(urwid.WidgetWrap):
     def set_date(self, game_date):
         self.text.set_text(game_date.strftime("%A, %Y-%m-%d"))
 
-class ScheduleView(urwid.WidgetWrap):
 
-    def __init__(self):
+class WatchDialog(BasePopUp):
 
-        today = datetime.now().date()
-        self.game_date = today
+    signals = ["watch"]
+
+    def __init__(self, game_id,
+                 resolution=None, from_beginning=None):
+
+        self.game_id = game_id
+        self.resolution = resolution
+        self.from_beginning = from_beginning
+
+        self.game_data = state.session.schedule(
+            game_id=self.game_id,
+        )["dates"][0]["games"][0]
+        # raise Exception(self.game_data)
+
+        self.title = urwid.Text("%s@%s" %(
+            self.game_data["teams"]["away"]["team"]["abbreviation"],
+            self.game_data["teams"]["home"]["team"]["abbreviation"],
+        ))
+
+        feed_map = sorted([
+            ("%s (%s)" %(e["mediaFeedType"].title(),
+                         e["callLetters"]), e["mediaId"].lower())
+            for e in state.session.get_media(self.game_id)
+        ], key=lambda v: v[0])
+        home_feed = next(state.session.get_media(
+            self.game_id,
+            preferred_stream = "home"
+        ))
+        self.feed_dropdown = Dropdown(
+            feed_map,
+            label="Feed",
+            default=home_feed["mediaId"]
+        )
+
+        urwid.connect_signal(
+            self.feed_dropdown,
+            "change",
+            lambda s, b, media_id: self.update_inning_dropdown(media_id)
+        )
+
+        self.resolution_dropdown = ResolutionDropdown(
+            default=resolution
+        )
+
+        self.inning_dropdown_placeholder = urwid.WidgetPlaceholder(urwid.Text(""))
+        self.update_inning_dropdown(self.feed_dropdown.selected_value)
+
+        self.ok_button = urwid.Button("OK")
+        urwid.connect_signal(self.ok_button, "click", self.watch)
+
+        self.cancel_button = urwid.Button("Cancel")
+        urwid.connect_signal(
+            self.cancel_button, "click",
+            lambda b: urwid.signals.emit_signal(self, "close_popup")
+        )
+
+        pile = urwid.Pile([
+            ("pack", self.title),
+            ("weight", 1, urwid.Pile([
+                ("weight", 1, urwid.Filler(
+                    urwid.Columns([
+                        ("weight", 1, self.feed_dropdown),
+                        ("weight", 1, self.resolution_dropdown),
+                    ]))),
+                ("weight", 1, urwid.Filler(self.inning_dropdown_placeholder)),
+                ("weight", 1, urwid.Filler(
+                    urwid.Columns([
+                    ("weight", 1, self.ok_button),
+                    ("weight", 1, self.cancel_button),
+                ])))
+            ]))
+        ])
+        super(WatchDialog, self).__init__(pile)
+
+    def update_inning_dropdown(self, media_id):
+        # raise Exception(media_id)
+        self.timestamps = state.session.media_timestamps(
+            self.game_id, media_id
+        )
+        del self.timestamps["S"]
+        timestamp_map = AttrDict(
+            ( k if k[0] in "TB" else "Start", k ) for k in self.timestamps.keys()
+        )
+        timestamp_map["Live"] = False
+        self.inning_dropdown = Dropdown(
+            timestamp_map, label="Begin playback",
+            default = timestamp_map["Start"] if self.from_beginning else timestamp_map["Live"]
+        )
+        self.inning_dropdown_placeholder.original_widget = self.inning_dropdown
+
+
+    def watch(self, source):
+        urwid.signals.emit_signal(
+            self,
+            "watch",
+            self.game_id,
+            self.resolution_dropdown.selected_value,
+            self.feed_dropdown.selected_value,
+            self.inning_dropdown.selected_value
+        )
+        urwid.signals.emit_signal(self, "close_popup")
+
+    def keypress(self, size, key):
+
+        if key == "meta enter":
+            self.ok_button.keypress(size, "enter")
+        else:
+            # return super(WatchDialog, self).keypress(size, key)
+            key = super(WatchDialog, self).keypress(size, key)
+        if key:
+            return
+        return key
+
+
+class ScheduleView(BaseView):
+
+    def __init__(self, date):
+
+        self.game_date = date
         self.toolbar = Toolbar()
         self.datebar = DateBar(self.game_date)
         self.table = GamesDataTable(self.toolbar.sport_id, self.game_date) # preseason
-        urwid.connect_signal(self.table, "watch",
-                             lambda dsource, game_id: self.watch(game_id))
+        urwid.connect_signal(self.table, "select",
+                             lambda source, selection: self.open_watch_dialog(selection["game_id"]))
         self.pile  = urwid.Pile([
             (1, self.toolbar),
             (1, self.datebar),
@@ -306,6 +428,18 @@ class ScheduleView(urwid.WidgetWrap):
         ])
         self.pile.focus_position = 2
         super(ScheduleView, self).__init__(self.pile)
+
+    def open_watch_dialog(self, game_id):
+        dialog = WatchDialog(game_id,
+                             resolution = self.toolbar.resolution,
+                             from_beginning = self.toolbar.start_from_beginning
+        )
+        urwid.connect_signal(
+            dialog,
+            "watch",
+            self.watch
+        )
+        self.open_popup(dialog, width=30, height=20)
 
     def keypress(self, size, key):
 
@@ -318,23 +452,28 @@ class ScheduleView(urwid.WidgetWrap):
             self.game_date = datetime.now().date()
             self.datebar.set_date(self.game_date)
             self.table.set_game_date(self.game_date)
-        elif key == "w":
-            # self._emit("watch", self.table.selection.data.game_id)
-            self.watch(self.table.selection.data.game_id)
+        elif key == "w": # watch home stream
+            self.watch(self.table.selection.data.game_id, preferred_stream="home")
+        elif key == "W": # watch away stream
+            self.watch(self.table.selection.data.game_id, preferred_stream="away")
         else:
             return key
 
+    def watch(self, game_id,
+              resolution=None, feed=None,
+              offset=None, preferred_stream=None):
 
-    def watch(self, game_id):
-        logger.info("playing game %d at %s" %(game_id, self.toolbar.resolution))
         try:
             state.proc = play.play_stream(
                 game_id,
-                self.toolbar.resolution,
-                self.toolbar.start_from_beginning,
+                resolution,
+                call_letters = feed,
+                preferred_stream = preferred_stream,
+                offset = offset
             )
         except play.MLBPlayException as e:
             logger.error(e)
+
 
 
 def main():
@@ -342,7 +481,14 @@ def main():
     global options
     global logger
 
+    today = datetime.now(pytz.timezone('US/Eastern')).date()
+
     parser = argparse.ArgumentParser()
+    parser.add_argument("-d", "--date", help="game date",
+                        type=valid_date,
+                        default=today)
+    parser.add_argument("-r", "--resolution", help="stream resolution",
+                        default="720p_alt")
     parser.add_argument("-v", "--verbose", action="store_true")
     options, args = parser.parse_known_args()
 
@@ -379,13 +525,13 @@ def main():
     screen = urwid.raw_display.Screen()
     screen.set_terminal_properties(256)
 
-    view = ScheduleView()
+    view = ScheduleView(options.date)
 
     log_console = widgets.ConsoleWindow()
     # log_box = urwid.BoxAdapter(urwid.LineBox(log_console), 10)
     pile = urwid.Pile([
         ("weight", 1, urwid.LineBox(view)),
-        (10, urwid.LineBox(log_console))
+        (6, urwid.LineBox(log_console))
     ])
 
     def global_input(key):

@@ -5,6 +5,10 @@ import re
 import base64
 import binascii
 import json
+import sqlite3
+import pickle
+import functools
+from contextlib import contextmanager
 
 import six
 from six.moves.http_cookiejar import LWPCookieJar
@@ -18,7 +22,7 @@ from orderedattrdict import AttrDict
 import orderedattrdict.yamlutils
 from orderedattrdict.yamlutils import AttrDictYAMLLoader
 import pytz
-import datetime
+from datetime import datetime, timedelta
 import dateutil.parser
 
 from . import config
@@ -56,8 +60,20 @@ ACCESS_TOKEN_URL = "https://edge.bamgrid.com/token"
 
 STREAM_URL_TEMPLATE="https://edge.svcs.mlb.com/media/{media_id}/scenarios/browser"
 
+AIRINGS_URL_TEMPLATE=(
+    "https://search-api-mlbtv.mlb.com/svc/search/v2/graphql/persisted/query/"
+    "core/Airings?variables={{%22partnerProgramIds%22%3A[%22{game_id}%22]}}"
+)
+
 SESSION_FILE=os.path.join(config.CONFIG_DIR, "session")
 COOKIE_FILE=os.path.join(config.CONFIG_DIR, "cookies")
+CACHE_FILE=os.path.join(config.CONFIG_DIR, "cache.sqlite")
+
+# Default cache duration to 60 seconds
+CACHE_DURATION_SHORT = 60 # 60 seconds
+CACHE_DURATION_MEDIUM = 60*60*24 # 1 day
+CACHE_DURATION_LONG = 60*60*24*30  # 30 days
+CACHE_DURATION_DEFAULT = CACHE_DURATION_SHORT
 
 class MLBSessionException(Exception):
     pass
@@ -75,7 +91,8 @@ class MLBSession(object):
             client_api_key=None,
             token=None,
             access_token=None,
-            access_token_expiry=None
+            access_token_expiry=None,
+            no_cache=False
     ):
 
         self.session = requests.Session()
@@ -93,12 +110,61 @@ class MLBSession(object):
             ("access_token", access_token),
             ("access_token_expiry", access_token_expiry)
         ])
+        self.no_cache = no_cache
+        self._cache_responses = False
+        if not os.path.exists(CACHE_FILE):
+            self.cache_setup(CACHE_FILE)
+        self.conn = sqlite3.connect(CACHE_FILE,
+                                    detect_types = sqlite3.PARSE_DECLTYPES)
+        self.cursor = self.conn.cursor()
+        self.cache_purge()
         self.login()
 
     def __getattr__(self, attr):
         if attr in ["delete", "get", "head", "options", "post", "put", "patch"]:
-            return getattr(self.session, attr)
-        raise AttributeError(attr)
+            # return getattr(self.session, attr)
+            session_method = getattr(self.session, attr)
+            return functools.partial(self.request, session_method)
+        # raise AttributeError(attr)
+
+    def request(self, method, url, *args, **kwargs):
+
+        response = None
+        use_cache = not self.no_cache and self._cache_responses
+        if use_cache:
+            logger.debug("getting cached response for %s" %(url))
+            self.cursor.execute(
+                "SELECT response, last_seen "
+                "FROM response_cache "
+                "WHERE url = ?",
+                (url,)
+            )
+            try:
+                (pickled_response, last_seen) = self.cursor.fetchone()
+                td = datetime.now() - last_seen
+                if td.seconds >= self._cache_responses:
+                    logger.debug("cache expired for %s" %(url))
+                else:
+                    response = pickle.loads(pickled_response)
+                    logger.debug("using cached response for %s" %(url))
+            except TypeError:
+                logger.debug("no cached response for %s" %(url))
+
+        if not response:
+            response = method(url, *args, **kwargs)
+
+        if use_cache:
+            pickled_response = pickle.dumps(response)
+            sql="""INSERT OR REPLACE
+            INTO response_cache (url, response, last_seen)
+            VALUES (?, ?, ?)"""
+            self.cursor.execute(
+                sql,
+                (url, pickled_response, datetime.now())
+            )
+            self.conn.commit()
+
+        return response
 
     @property
     def username(self):
@@ -109,12 +175,13 @@ class MLBSession(object):
         return self._state.password
 
     @classmethod
-    def new(cls):
+    def new(cls, **kwargs):
         try:
             return cls.load()
         except:
             return cls(username=config.settings.username,
-                       password=config.settings.password)
+                       password=config.settings.password,
+                       **kwargs)
 
     @classmethod
     def destroy(cls):
@@ -133,6 +200,44 @@ class MLBSession(object):
             yaml.dump(self._state, outfile, default_flow_style=False)
         self.session.cookies.save(COOKIE_FILE)
 
+    @contextmanager
+    def cache_responses(self, duration=CACHE_DURATION_DEFAULT):
+        self._cache_responses = duration
+        try:
+            yield
+        finally:
+            self._cache_responses = False
+
+    def cache_responses_short(self):
+        return self.cache_responses(CACHE_DURATION_SHORT)
+
+    def cache_responses_medium(self):
+        return self.cache_responses(CACHE_DURATION_MEDIUM)
+
+    def cache_responses_long(self):
+        return self.cache_responses(CACHE_DURATION_LONG)
+
+    def cache_setup(self, dbfile):
+
+        conn = sqlite3.connect(dbfile)
+        c = conn.cursor()
+        c.execute('''
+        CREATE TABLE response_cache
+        (url TEXT,
+        response TEXT,
+        last_seen TIMESTAMP DEFAULT (datetime('now','localtime')),
+        PRIMARY KEY (url))''');
+        conn.commit()
+        c.close()
+
+    def cache_purge(self, days=CACHE_DURATION_LONG):
+
+        self.cursor.execute(
+            "DELETE "
+            "FROM response_cache "
+            "WHERE last_seen < datetime('now', '-%d days')" %(days)
+        )
+
     def login(self):
 
         logger.debug("checking for existing log in")
@@ -140,7 +245,7 @@ class MLBSession(object):
         initial_url = ("https://secure.mlb.com/enterworkflow.do"
                        "?flowId=registration.wizard&c_id=mlb")
 
-        # res = self.session.get(initial_url)
+        # res = self.get(initial_url)
         # if not res.status_code == 200:
         #     raise MLBSessionException(res.content)
 
@@ -159,7 +264,7 @@ class MLBSession(object):
 
         login_url = "https://securea.mlb.com/authenticate.do"
 
-        res = self.session.post(
+        res = self.post(
             login_url,
             data=data,
             headers={"Referer": (initial_url)}
@@ -176,7 +281,7 @@ class MLBSession(object):
 
         logged_in_url = ("https://web-secure.mlb.com/enterworkflow.do"
                          "?flowId=registration.newsletter&c_id=mlb")
-        content = self.session.get(logged_in_url).text
+        content = self.get(logged_in_url).text
         parser = lxml.etree.HTMLParser()
         data = lxml.etree.parse(StringIO(content), parser)
         if "Login/Register" in data.xpath(".//title")[0].text:
@@ -211,7 +316,7 @@ class MLBSession(object):
     def update_api_keys(self):
 
         logger.debug("updating api keys")
-        content = self.session.get("https://www.mlb.com/tv/g490865/").text
+        content = self.get("https://www.mlb.com/tv/g490865/").text
         parser = lxml.etree.HTMLParser()
         data = lxml.etree.parse(StringIO(content), parser)
 
@@ -229,7 +334,7 @@ class MLBSession(object):
         if not self._state.token:
             headers = {"x-api-key": self.api_key}
 
-            response = self.session.get(
+            response = self.get(
                 TOKEN_URL_TEMPLATE.format(
                     ipid=self.ipid, fingerprint=self.fingerprint, platform=PLATFORM
                 ),
@@ -257,7 +362,7 @@ class MLBSession(object):
     def access_token(self):
         logger.debug("getting access token")
         if not self._state.access_token or not self.access_token_expiry or \
-                self.access_token_expiry < datetime.datetime.now(tz=pytz.UTC):
+                self.access_token_expiry < datetime.now(tz=pytz.UTC):
 
             try:
                 self._state.access_token, self.access_token_expiry = self._get_access_token()
@@ -286,7 +391,7 @@ class MLBSession(object):
             "subject_token": self.token,
             "subject_token_type": "urn:ietf:params:oauth:token-type:jwt"
         }
-        response = self.session.post(
+        response = self.post(
             ACCESS_TOKEN_URL,
             data=data,
             headers=headers
@@ -294,18 +399,18 @@ class MLBSession(object):
         response.raise_for_status()
         token_response = response.json()
 
-        token_expiry = datetime.datetime.now(tz=pytz.UTC) + \
-                       datetime.timedelta(seconds=token_response["expires_in"])
+        token_expiry = datetime.now(tz=pytz.UTC) + \
+                       timedelta(seconds=token_response["expires_in"])
 
         return token_response["access_token"], token_expiry
 
     def content(self, game_id):
 
-        return self.session.get(GAME_CONTENT_URL_TEMPLATE.format(game_id=game_id)).json()
+        return self.get(GAME_CONTENT_URL_TEMPLATE.format(game_id=game_id)).json()
 
     # def feed(self, game_id):
 
-    #     return self.session.get(GAME_FEED_URL.format(game_id=game_id)).json()
+    #     return self.get(GAME_FEED_URL.format(game_id=game_id)).json()
 
     @memo(region="short")
     def schedule(
@@ -336,33 +441,132 @@ class MLBSession(object):
             team_id = team_id if team_id else "",
             game_id = game_id if game_id else ""
         )
-        return self.session.get(url).json()
+        with self.cache_responses_short():
+            return self.get(url).json()
 
     @memo(region="short")
-    def get_media(self, game_id,
-                  title="MLBTV",
-                  preferred_stream=None):
-
-        logger.debug("geting media for game %d" %(game_id))
+    def get_epgs(self, game_id, title="MLBTV"):
         schedule = self.schedule(game_id=game_id)
-        # raise Exception(schedule)
         try:
             # Get last date for games that have been rescheduled to a later date
             game = schedule["dates"][-1]["games"][0]
         except KeyError:
             logger.debug("no game data")
             return
-        for epg in game["content"]["media"]["epg"]:
-            if title in [None, epg["title"]]:
-                for item in epg["items"]:
-                    if preferred_stream in [None, item["mediaFeedType"]]:
-                        logger.debug("found preferred stream")
-                        yield item
-                else:
-                    if len(epg["items"]):
-                        logger.debug("using non-preferred stream")
-                        yield epg["items"][0]
+        epgs = game["content"]["media"]["epg"]
+
+        if not isinstance(epgs, list):
+            epgs = [epgs]
+
+        return [ e for e in epgs if (not title) or title == e["title"] ]
+
+    def get_media(self,
+                  game_id,
+                  media_id=None,
+                  title="MLBTV",
+                  preferred_stream=None,
+                  call_letters=None):
+
+        logger.debug("geting media for game %d" %(game_id))
+
+        epgs = self.get_epgs(game_id, title)
+        for epg in epgs:
+            for item in epg["items"]:
+                if (not preferred_stream
+                    or (item.get("mediaFeedType", "").lower() == preferred_stream)
+                ) and (
+                    not call_letters
+                    or (item.get("callLetters", "").lower() == call_letters)
+                ) and (
+                    not media_id
+                    or (item.get("mediaId", "").lower() == media_id)
+                ):
+                    logger.debug("found preferred stream")
+                    yield item
+            else:
+                if len(epg["items"]):
+                    logger.debug("using non-preferred stream")
+                    yield epg["items"][0]
         # raise StopIteration
+
+    def airings(self, game_id):
+
+        airings_url = AIRINGS_URL_TEMPLATE.format(game_id = game_id)
+        airings = self.get(
+            airings_url
+        ).json()["data"]["Airings"]
+        return airings
+
+
+    def media_timestamps(self, game_id, media_id):
+
+        try:
+            airing = next(a for a in self.airings(game_id)
+                          if a["mediaId"] == media_id)
+        except StopIteration:
+            raise MLBSessionException("No airing for media %s" %(media_id))
+
+        start_timestamps = []
+        try:
+            start_time = next(
+                    t["startDatetime"] for t in
+                    next(m for m in airing["milestones"]
+                     if m["milestoneType"] == "BROADCAST_START"
+                    )["milestoneTime"]
+                if t["type"] == "absolute"
+                )
+
+        except StopIteration:
+            # Some streams don't have a "BROADCAST_START" milestone.  We need
+            # something, so we use the scheduled game start time, which is
+            # probably wrong.
+            start_time = airing["startDate"]
+
+        start_timestamps.append(
+            ("S", start_time)
+        )
+
+        try:
+            start_offset = next(
+                t["start"] for t in
+                next(m for m in airing["milestones"]
+                     if m["milestoneType"] == "BROADCAST_START"
+                )["milestoneTime"]
+                if t["type"] == "offset"
+            )
+        except StopIteration:
+            # Same as above.  Missing BROADCAST_START milestone means we
+            # probably don't get accurate offsets for inning milestones.
+            start_offset = 0
+
+        start_timestamps.append(
+            ("SO", start_offset)
+        )
+
+        timestamps = AttrDict(start_timestamps)
+        timestamps.update(AttrDict([
+            (
+            "%s%s" %(
+                "T"
+                if next(
+                        k for k in m["keywords"]
+                        if k["type"] == "top"
+                )["value"] == "true"
+                else "B",
+                int(
+                    next(
+                        k for k in m["keywords"] if k["type"] == "inning"
+                    )["value"]
+                )),
+            next(t["start"]
+                      for t in m["milestoneTime"]
+                      if t["type"] == "offset"
+                 )
+            )
+                 for m in airing["milestones"]
+                 if m["milestoneType"] == "INNING_START"
+        ]))
+        return timestamps
 
     def get_stream(self, media_id):
 
@@ -381,8 +585,10 @@ class MLBSession(object):
             "x-bamsdk-platform": PLATFORM,
             "origin": "https://www.mlb.com"
         }
-        stream = self.session.get(
-            STREAM_URL_TEMPLATE.format(media_id=media_id),
+        stream_url = STREAM_URL_TEMPLATE.format(media_id=media_id)
+        logger.info("getting stream %s" %(stream_url))
+        stream = self.get(
+            stream_url,
             headers=headers
         ).json()
         logger.debug("stream response: %s" %(stream))
