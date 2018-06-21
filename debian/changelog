@@ -1,3 +1,9 @@
+mlbstreamer (0.0.10-2) unstable; urgency=medium
+
+  * Correct dependency on panwid
+
+ -- Sebastien Delafond <seb@debian.org>  Thu, 21 Jun 2018 15:01:14 +0200
+
 mlbstreamer (0.0.10-1) unstable; urgency=medium
 
   * New upstream version
