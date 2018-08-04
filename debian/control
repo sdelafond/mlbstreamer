@@ -10,7 +10,7 @@ Vcs-Browser: https://salsa.debian.org/debian/mlbstreamer
 
 Package: mlbstreamer
 Architecture: all
-Depends: ${misc:Depends}, streamlink (>= 0.11.0+dfsg-1), ${python3:Depends}, python3-panwid (>= 0.2.5-1), python3-urwid-utils (>= 0.1.2-1)
+Depends: ${misc:Depends}, streamlink (>= 0.11.0+dfsg-1), ${python3:Depends}, python3-panwid (>= 0.2.5-1), python3-urwid-utils (>= 0.1.2-1), python3-distutils
 Description: Interface to the MLB.TV media offering
  A collection of tools to stream and record baseball games from
  MLB.TV. While the main streaming content is mostly for paid MLB.TV
