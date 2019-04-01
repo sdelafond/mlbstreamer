@@ -1,0 +1,9 @@
+mlbstreamer (0.0.11.dev0+git20190330-1) unstable; urgency=medium
+
+  The configuration file format has changed, please update your
+  ~/.config/mlbstreamer/config according to the example in
+  /usr/share/doc/mlbstreamer/config.yaml.sample.
+
+ -- Sebastien Delafond <seb@debian.org>  Mon, 01 Apr 2019 10:37:01 +0200
+
+
