@@ -1,3 +1,12 @@
+mlbstreamer (0.0.11.dev0+git20190330-1) unstable; urgency=medium
+
+  * New upstream version (Closes: #926165)
+  * Add dependency on python3-requests-toolbelt
+  * Bump-up Standards-Version
+  * Add NEWS.Debian to mention the change in config file format
+
+ -- Sebastien Delafond <seb@debian.org>  Mon, 01 Apr 2019 10:12:50 +0200
+
 mlbstreamer (0.0.10-3) unstable; urgency=medium
 
   * Depend on python3-distutils (Closes: #905343)
